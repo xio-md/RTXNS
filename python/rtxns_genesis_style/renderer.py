@@ -665,6 +665,7 @@ class _RuntimeHandle:
         backend: str,
         device_index: int,
         enable_debug: bool,
+        enable_external_interop: bool,
     ):
         module_dir = module_dir.resolve()
         runtime_dir = runtime_dir.resolve()
@@ -672,7 +673,15 @@ class _RuntimeHandle:
             sys.path.insert(0, str(module_dir))
 
         module = _import_native_renderer_module()
-        options = (module.__name__, str(module_dir), str(runtime_dir), backend, int(device_index), bool(enable_debug))
+        options = (
+            module.__name__,
+            str(module_dir),
+            str(runtime_dir),
+            backend,
+            int(device_index),
+            bool(enable_debug),
+            bool(enable_external_interop),
+        )
 
         with cls._lock:
             if cls._refcount == 0:
@@ -681,6 +690,7 @@ class _RuntimeHandle:
                     backend=backend,
                     device_index=int(device_index),
                     enable_debug=bool(enable_debug),
+                    enable_external_interop=bool(enable_external_interop),
                 )
                 cls._module = module
                 cls._options = options
@@ -752,6 +762,7 @@ class GenesisStyleRenderer:
         enable_debug: bool = False,
         rendered_envs_idx: Optional[Sequence[int]] = None,
         particle_sphere_segments: tuple[int, int] = (10, 20),
+        enable_external_interop: bool = False,
     ) -> None:
         self.module_dir = Path(module_dir) if module_dir is not None else _default_module_dir()
         self.runtime_dir = Path(runtime_dir) if runtime_dir is not None else _default_runtime_dir()
@@ -763,6 +774,7 @@ class GenesisStyleRenderer:
             backend=backend,
             device_index=device_index,
             enable_debug=enable_debug,
+            enable_external_interop=enable_external_interop,
         )
         self._scene = self._rr.create_scene()
 
@@ -801,6 +813,13 @@ class GenesisStyleRenderer:
         self._temp_dir = _repo_root() / ".temp" / "rtxns_genesis_style"
         self._temp_dir.mkdir(parents=True, exist_ok=True)
         self._scene_path = self._temp_dir / "scene.glb"
+
+    def create_shared_transform_stream(self, record_count: int, slot_count: int = 3):
+        """Create a Vulkan/CUDA shared transform stream on this renderer context."""
+        return self._rr.create_shared_transform_stream(
+            record_count=int(record_count),
+            slot_count=int(slot_count),
+        )
 
     def __enter__(self) -> "GenesisStyleRenderer":
         return self

@@ -8,8 +8,10 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <stdexcept>
 #include <utility>
@@ -32,6 +34,7 @@
 #include <donut/render/GeometryPasses.h>
 #include <nvrhi/utils.h>
 
+#include "../Interop/SharedTransformStream.h"
 #include "../RayTracedShadow/RayTracedShadowPass.h"
 #include "../RayTracedShadow/SceneGeometryProvider.h"
 #include "../RayTracedShadow/AccelerationStructure.h"
@@ -115,6 +118,11 @@ namespace rtxns::python
             {
                 throw std::runtime_error("The RTXNS Donut Python backend supports backend='vulkan' or 'd3d12'.");
             }
+            if (options.enable_external_interop && isD3D12)
+            {
+                throw std::runtime_error(
+                    "External CUDA interop currently requires backend='vulkan'.");
+            }
 
             DeviceManager* raw_manager = DeviceManager::Create(
                 isD3D12 ? nvrhi::GraphicsAPI::D3D12 : nvrhi::GraphicsAPI::VULKAN);
@@ -127,8 +135,8 @@ namespace rtxns::python
 
             donut::app::DeviceCreationParameters device_params;
             device_params.adapterIndex = options.device_index;
-            device_params.enableDebugRuntime = false;
-            device_params.enableNvrhiValidationLayer = false;
+            device_params.enableDebugRuntime = options.enable_debug;
+            device_params.enableNvrhiValidationLayer = options.enable_debug;
             device_params.backBufferWidth = 0;
             device_params.backBufferHeight = 0;
             device_params.startFullscreen = false;
@@ -141,6 +149,18 @@ namespace rtxns::python
             {
                 device_params.optionalVulkanDeviceExtensions.push_back(
                     VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME);
+
+                if (options.enable_external_interop)
+                {
+                    device_params.requiredVulkanDeviceExtensions.push_back(
+                        VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME);
+                    device_params.requiredVulkanDeviceExtensions.push_back(
+                        VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
+                    device_params.requiredVulkanDeviceExtensions.push_back(
+                        VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME);
+                    device_params.requiredVulkanDeviceExtensions.push_back(
+                        VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);
+                }
             }
 
             if (!m_device_manager->CreateHeadlessDevice(device_params))
@@ -154,6 +174,7 @@ namespace rtxns::python
             // Detect OMM hardware support
             m_ommSupported = m_device_manager->GetDevice()->queryFeatureSupport(
                 nvrhi::Feature::RayTracingOpacityMicromap);
+            m_externalInteropEnabled = options.enable_external_interop;
 
             m_root_fs = std::make_shared<RootFileSystem>();
 
@@ -199,6 +220,10 @@ namespace rtxns::python
         }
 
         [[nodiscard]] bool isOmmSupported() const { return m_ommSupported; }
+        [[nodiscard]] bool isExternalInteropEnabled() const
+        {
+            return m_externalInteropEnabled;
+        }
 
     private:
         std::unique_ptr<DeviceManager, DeviceManagerDeleter> m_device_manager;
@@ -206,6 +231,7 @@ namespace rtxns::python
         std::shared_ptr<ShaderFactory> m_shader_factory;
         std::shared_ptr<CommonRenderPasses> m_common_passes;
         bool m_ommSupported = false;
+        bool m_externalInteropEnabled = false;
     };
 
     // TODO(week2): Move to render_view_slot.h after stabilization.
@@ -614,6 +640,157 @@ namespace rtxns::python
                     &transform.rotation,
                     &transform.scaling);
             }
+        }
+
+        [[nodiscard]] HeadlessPbrScene::SharedTransformConsumeToken
+            consume_shared_transform_slot(
+                const std::shared_ptr<rtxns::interop::SharedTransformStream>& stream,
+                uint32_t slot,
+                const std::vector<uint32_t>& handles)
+        {
+            if (!stream)
+                throw std::invalid_argument("stream must not be None.");
+            if (handles.size() != stream->record_count())
+            {
+                throw std::invalid_argument(
+                    "consume_shared_transform_slot expects one node handle per "
+                    "stream transform record.");
+            }
+
+            std::scoped_lock lock(m_sharedTransformMutex);
+
+            // Reject bad caller arguments before consuming a ready slot.
+            std::unordered_set<uint32_t> uniqueHandles;
+            uniqueHandles.reserve(handles.size());
+            for (uint32_t handle : handles)
+            {
+                (void)node_from_handle(handle);
+                if (!uniqueHandles.insert(handle).second)
+                {
+                    throw std::invalid_argument(
+                        "consume_shared_transform_slot does not accept duplicate handles.");
+                }
+            }
+
+            const std::vector<uint8_t> payload = stream->consume_slot(slot);
+            if (payload.size() != stream->slot_payload_size() ||
+                payload.size() < rtxns::interop::SharedTransformStream::kHeaderSize)
+            {
+                throw std::runtime_error(
+                    "Shared transform slot payload has an invalid byte length.");
+            }
+
+            const auto read_value = [&payload]<typename T>(size_t offset)
+            {
+                if (offset > payload.size() || sizeof(T) > payload.size() - offset)
+                    throw std::runtime_error("Shared transform slot header is truncated.");
+                T value{};
+                std::memcpy(&value, payload.data() + offset, sizeof(T));
+                return value;
+            };
+
+            const uint32_t magic = read_value.template operator()<uint32_t>(0);
+            const uint16_t abiMajor = read_value.template operator()<uint16_t>(4);
+            const uint16_t abiMinor = read_value.template operator()<uint16_t>(6);
+            const uint32_t headerSize = read_value.template operator()<uint32_t>(8);
+            const uint32_t recordCount = read_value.template operator()<uint32_t>(12);
+            const uint64_t epoch = read_value.template operator()<uint64_t>(16);
+            const uint64_t simulationStep = read_value.template operator()<uint64_t>(24);
+            const uint64_t timestampNs = read_value.template operator()<uint64_t>(32);
+
+            if (magic != rtxns::interop::SharedTransformStream::kHeaderMagic)
+                throw std::runtime_error("Shared transform slot has invalid FST1 magic.");
+            if (abiMajor != rtxns::interop::SharedTransformStream::kAbiMajor ||
+                abiMinor != rtxns::interop::SharedTransformStream::kAbiMinor)
+            {
+                throw std::runtime_error(
+                    "Shared transform slot has an unsupported FST1 ABI version.");
+            }
+            if (headerSize != rtxns::interop::SharedTransformStream::kHeaderSize)
+            {
+                throw std::runtime_error(
+                    "Shared transform slot has an invalid FST1 header_size.");
+            }
+            if (recordCount != stream->record_count() ||
+                recordCount != handles.size())
+            {
+                throw std::runtime_error(
+                    "Shared transform slot record_count does not match the "
+                    "stream and node handles.");
+            }
+
+            for (auto iterator = m_sharedTransformEpochs.begin();
+                 iterator != m_sharedTransformEpochs.end();)
+            {
+                if (iterator->first.expired())
+                    iterator = m_sharedTransformEpochs.erase(iterator);
+                else
+                    ++iterator;
+            }
+
+            const std::weak_ptr<rtxns::interop::SharedTransformStream> streamKey(stream);
+            const auto previousEpoch = m_sharedTransformEpochs.find(streamKey);
+            if (previousEpoch != m_sharedTransformEpochs.end() &&
+                epoch <= previousEpoch->second)
+            {
+                throw std::runtime_error(
+                    "Shared transform slot epoch is stale or non-monotonic.");
+            }
+
+            std::vector<std::vector<float>> matrices;
+            matrices.reserve(recordCount);
+            for (uint32_t recordIndex = 0; recordIndex < recordCount; ++recordIndex)
+            {
+                const size_t recordOffset =
+                    rtxns::interop::SharedTransformStream::kHeaderSize +
+                    static_cast<size_t>(recordIndex) *
+                        rtxns::interop::SharedTransformStream::kRecordStride;
+
+                float affineRowMajor[12]{};
+                std::memcpy(
+                    affineRowMajor,
+                    payload.data() + recordOffset,
+                    sizeof(affineRowMajor));
+                if (!std::all_of(
+                        std::begin(affineRowMajor),
+                        std::end(affineRowMajor),
+                        [](float value)
+                        {
+                            return std::isfinite(value);
+                        }))
+                {
+                    throw std::runtime_error(
+                        "Shared transform records must contain only finite float3x4 values.");
+                }
+
+                // The stream ABI and the established Python scene API both use
+                // row-major flattened matrices. Preserve that input convention;
+                // decompose_node_transform performs the Donut-specific transpose.
+                std::vector<float> matrix(16, 0.0f);
+                for (uint32_t row = 0; row < 3; ++row)
+                {
+                    for (uint32_t column = 0; column < 4; ++column)
+                    {
+                        matrix[row * 4 + column] =
+                            affineRowMajor[row * 4 + column];
+                    }
+                }
+                matrix[15] = 1.0f;
+                matrices.push_back(std::move(matrix));
+            }
+
+            // Reuse the established CPU SceneGraph transform path. Scene::Refresh
+            // and the existing CPU-side TLAS update remain unchanged.
+            update_node_transforms_batch(handles, matrices);
+            m_sharedTransformEpochs[streamKey] = epoch;
+
+            HeadlessPbrScene::SharedTransformConsumeToken token;
+            token.epoch = epoch;
+            token.simulation_step = simulationStep;
+            token.timestamp_ns = timestampNs;
+            token.slot = slot;
+            token.record_count = recordCount;
+            return token;
         }
 
         [[nodiscard]] std::vector<float> get_node_world_transform(
@@ -2816,6 +2993,13 @@ namespace rtxns::python
         std::unordered_map<std::string, uint32_t> m_nodeHandleByName;
         std::unordered_set<std::string> m_ambiguousNodeNames;
         std::vector<MeshSensorLabel> m_meshSensorLabels;
+        std::mutex m_sharedTransformMutex;
+        std::map<
+            std::weak_ptr<rtxns::interop::SharedTransformStream>,
+            uint64_t,
+            std::owner_less<
+                std::weak_ptr<rtxns::interop::SharedTransformStream>>>
+            m_sharedTransformEpochs;
 
         // --- Async batch tracking ---
         struct PendingBatch {
@@ -2984,6 +3168,15 @@ namespace rtxns::python
         m_impl->update_node_transforms_batch(handles, matrices);
     }
 
+    HeadlessPbrScene::SharedTransformConsumeToken
+        HeadlessPbrScene::consume_shared_transform_slot(
+            const std::shared_ptr<rtxns::interop::SharedTransformStream>& stream,
+            uint32_t slot,
+            const std::vector<uint32_t>& handles)
+    {
+        return m_impl->consume_shared_transform_slot(stream, slot, handles);
+    }
+
     std::vector<float> HeadlessPbrScene::get_node_world_transform(
         const std::string& name) const
     {
@@ -3110,5 +3303,34 @@ namespace rtxns::python
         }
 
         return std::make_shared<HeadlessPbrScene>(std::move(context));
+    }
+
+    std::shared_ptr<rtxns::interop::SharedTransformStream>
+        create_shared_transform_stream(uint32_t record_count, uint32_t slot_count)
+    {
+        std::shared_ptr<RendererContext> context;
+        {
+            std::scoped_lock lock(g_context_mutex);
+            context = g_context;
+        }
+
+        if (!context)
+        {
+            throw std::runtime_error(
+                "The RTXNS Donut Python backend is not initialized. Call init(...) first.");
+        }
+        if (!context->isExternalInteropEnabled())
+        {
+            throw std::runtime_error(
+                "External interop is disabled. Reinitialize with "
+                "enable_external_interop=True.");
+        }
+
+        nvrhi::IDevice* device = context->device();
+        return std::make_shared<rtxns::interop::SharedTransformStream>(
+            std::move(context),
+            device,
+            record_count,
+            slot_count);
     }
 }

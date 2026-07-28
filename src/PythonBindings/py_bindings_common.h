@@ -1,7 +1,10 @@
 #pragma once
 
 #include "headless_pbr.h"
+#include "../Interop/SharedTransformStream.h"
 
+#include <iomanip>
+#include <sstream>
 #include <string>
 #include <unordered_set>
 
@@ -13,6 +16,158 @@ namespace py = pybind11;
 inline void bind_rtxns_headless_pbr_module(py::module_ &m)
 {
     m.doc() = "Headless Vulkan PBR renderer bindings for the RTXNS Donut backend.";
+
+    using rtxns::interop::OwnedWin32Handle;
+    using rtxns::interop::SharedTransformStream;
+
+    py::class_<OwnedWin32Handle, std::shared_ptr<OwnedWin32Handle>>(
+        m,
+        "OwnedWin32Handle",
+        "Owns one duplicated Win32 handle until close(), detach(), or destruction.")
+        .def_property_readonly("value", &OwnedWin32Handle::value)
+        .def_property_readonly("closed", &OwnedWin32Handle::closed)
+        .def("detach",
+            &OwnedWin32Handle::detach,
+            "Transfer ownership to the caller and return the raw handle value.")
+        .def("close", &OwnedWin32Handle::close)
+        .def("__int__", &OwnedWin32Handle::value)
+        .def("__enter__",
+            [](const std::shared_ptr<OwnedWin32Handle>& self)
+            {
+                return self;
+            })
+        .def("__exit__",
+            [](OwnedWin32Handle& self, py::object, py::object, py::object)
+            {
+                self.close();
+            });
+
+    py::class_<SharedTransformStream, std::shared_ptr<SharedTransformStream>>(
+        m,
+        "SharedTransformStream",
+        "Triple-buffered Vulkan/CUDA transform transport with binary semaphore handoff.")
+        .def_property_readonly("record_count", &SharedTransformStream::record_count)
+        .def_property_readonly("slot_count", &SharedTransformStream::slot_count)
+        .def_property_readonly(
+            "slot_payload_size",
+            &SharedTransformStream::slot_payload_size)
+        .def_property_readonly("slot_stride", &SharedTransformStream::slot_stride)
+        .def_property_readonly("logical_size", &SharedTransformStream::logical_size)
+        .def_property_readonly(
+            "allocation_size",
+            &SharedTransformStream::allocation_size)
+        .def_property_readonly("closed", &SharedTransformStream::closed)
+        .def_property_readonly("poisoned", &SharedTransformStream::poisoned)
+        .def("descriptor",
+            [](const SharedTransformStream& self)
+            {
+                py::dict descriptor;
+                descriptor["abi"] = "flora.shared_transform.v1";
+                descriptor["abi_major"] = SharedTransformStream::kAbiMajor;
+                descriptor["abi_minor"] = SharedTransformStream::kAbiMinor;
+                descriptor["header_magic"] = SharedTransformStream::kHeaderMagic;
+                descriptor["header_size"] = SharedTransformStream::kHeaderSize;
+                descriptor["record_count"] = self.record_count();
+                descriptor["record_stride"] = SharedTransformStream::kRecordStride;
+                descriptor["record_layout"] = "row_major_float3x4";
+                descriptor["slot_count"] = self.slot_count();
+                descriptor["slot_payload_size"] = self.slot_payload_size();
+                descriptor["slot_stride"] = self.slot_stride();
+                descriptor["slot_alignment"] =
+                    SharedTransformStream::kSlotAlignment;
+                descriptor["logical_size"] = self.logical_size();
+                descriptor["allocation_size"] = self.allocation_size();
+                descriptor["memory_offset"] = self.memory_offset();
+                descriptor["dedicated_allocation"] = true;
+                descriptor["memory_handle_type"] = "opaque_win32";
+                descriptor["semaphore_handle_type"] = "opaque_win32";
+                descriptor["semaphore_type"] = "binary";
+                descriptor["memory_handle"] = self.duplicate_memory_handle();
+
+                const auto uuid = self.device_uuid();
+                descriptor["device_uuid"] = py::bytes(
+                    reinterpret_cast<const char*>(uuid.data()),
+                    static_cast<py::ssize_t>(uuid.size()));
+                std::ostringstream uuid_hex;
+                uuid_hex << std::hex << std::setfill('0');
+                for (uint8_t byte : uuid)
+                    uuid_hex << std::setw(2) << static_cast<unsigned int>(byte);
+                descriptor["device_uuid_hex"] = uuid_hex.str();
+
+                py::dict header_layout;
+                header_layout["magic"] = py::make_tuple(0, "uint32");
+                header_layout["abi_major"] = py::make_tuple(4, "uint16");
+                header_layout["abi_minor"] = py::make_tuple(6, "uint16");
+                header_layout["header_size"] = py::make_tuple(8, "uint32");
+                header_layout["record_count"] = py::make_tuple(12, "uint32");
+                header_layout["epoch"] = py::make_tuple(16, "uint64");
+                header_layout["simulation_step"] = py::make_tuple(24, "uint64");
+                header_layout["timestamp_ns"] = py::make_tuple(32, "uint64");
+                header_layout["flags"] = py::make_tuple(40, "uint32");
+                descriptor["header_layout"] = std::move(header_layout);
+
+                py::list slots;
+                for (uint32_t index = 0; index < self.slot_count(); ++index)
+                {
+                    py::dict slot;
+                    slot["index"] = index;
+                    slot["offset"] = self.slot_offset(index);
+                    slot["ready_handle"] = self.duplicate_ready_handle(index);
+                    slot["consumed_handle"] =
+                        self.duplicate_consumed_handle(index);
+                    slots.append(std::move(slot));
+                }
+                descriptor["slots"] = std::move(slots);
+                return descriptor;
+            },
+            "Return the ABI descriptor with fresh caller-owned Win32 handle duplicates.")
+        .def("debug_consume_slot",
+            [](SharedTransformStream& self, uint32_t slot)
+            {
+                auto bytes = [&]()
+                {
+                    py::gil_scoped_release release;
+                    return self.debug_consume_slot(slot);
+                }();
+                return py::bytes(
+                    reinterpret_cast<const char*>(bytes.data()),
+                    static_cast<py::ssize_t>(bytes.size()));
+            },
+            py::arg("slot"))
+        .def("debug_consume_slot_u32",
+            [](SharedTransformStream& self, uint32_t slot)
+            {
+                py::gil_scoped_release release;
+                return self.debug_consume_slot_u32(slot);
+            },
+            py::arg("slot"))
+        .def("debug_publish_slot",
+            [](SharedTransformStream& self, uint32_t slot, py::bytes payload)
+            {
+                const std::string bytes = payload;
+                const std::vector<uint8_t> data(bytes.begin(), bytes.end());
+                py::gil_scoped_release release;
+                self.debug_publish_slot(slot, data);
+            },
+            py::arg("slot"),
+            py::arg("payload"))
+        .def("close",
+            [](SharedTransformStream& self)
+            {
+                py::gil_scoped_release release;
+                self.close();
+            })
+        .def("__enter__",
+            [](const std::shared_ptr<SharedTransformStream>& self)
+            {
+                return self;
+            })
+        .def("__exit__",
+            [](SharedTransformStream& self, py::object, py::object, py::object)
+            {
+                py::gil_scoped_release release;
+                self.close();
+            });
 
     py::class_<rtxns::python::HeadlessPbrScene, std::shared_ptr<rtxns::python::HeadlessPbrScene>>(m, "Scene")
         .def("load_scene",
@@ -54,6 +209,33 @@ inline void bind_rtxns_headless_pbr_module(py::module_ &m)
             &rtxns::python::HeadlessPbrScene::update_node_transforms_batch,
             py::arg("handles"),
             py::arg("matrices"))
+        .def("consume_shared_transform_slot",
+            [](rtxns::python::HeadlessPbrScene& self,
+                const std::shared_ptr<SharedTransformStream>& stream,
+                uint32_t slot,
+                const std::vector<uint32_t>& handles)
+            {
+                const auto token = [&]()
+                {
+                    py::gil_scoped_release release;
+                    return self.consume_shared_transform_slot(
+                        stream,
+                        slot,
+                        handles);
+                }();
+
+                py::dict result;
+                result["epoch"] = token.epoch;
+                result["simulation_step"] = token.simulation_step;
+                result["timestamp_ns"] = token.timestamp_ns;
+                result["slot"] = token.slot;
+                result["record_count"] = token.record_count;
+                return result;
+            },
+            py::arg("stream"),
+            py::arg("slot"),
+            py::arg("handles"),
+            "Consume one FST1 slot entirely in C++ and update mapped scene nodes.")
         .def("get_node_world_transform",
             &rtxns::python::HeadlessPbrScene::get_node_world_transform,
             py::arg("name"))
@@ -283,13 +465,18 @@ inline void bind_rtxns_headless_pbr_module(py::module_ &m)
         .def_property_readonly("height", &rtxns::python::HeadlessPbrScene::height);
 
     m.def("init",
-        [](const std::string &runtime_dir, const std::string &backend, int device_index, bool enable_debug)
+        [](const std::string &runtime_dir,
+            const std::string &backend,
+            int device_index,
+            bool enable_debug,
+            bool enable_external_interop)
         {
             rtxns::python::ContextInitOptions options;
             options.runtime_dir = runtime_dir;
             options.backend = backend;
             options.device_index = device_index;
             options.enable_debug = enable_debug;
+            options.enable_external_interop = enable_external_interop;
 
             py::gil_scoped_release release;
             rtxns::python::initialize(options);
@@ -297,9 +484,20 @@ inline void bind_rtxns_headless_pbr_module(py::module_ &m)
         py::arg("runtime_dir") = "",
         py::arg("backend") = "vulkan",
         py::arg("device_index") = -1,
-        py::arg("enable_debug") = false);
+        py::arg("enable_debug") = false,
+        py::arg("enable_external_interop") = false);
 
     m.def("create_scene", &rtxns::python::create_scene);
+    m.def("create_shared_transform_stream",
+        [](uint32_t record_count, uint32_t slot_count)
+        {
+            py::gil_scoped_release release;
+            return rtxns::python::create_shared_transform_stream(
+                record_count,
+                slot_count);
+        },
+        py::arg("record_count"),
+        py::arg("slot_count") = 3);
 
     m.def("destroy",
         []()

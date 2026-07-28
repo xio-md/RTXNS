@@ -25,6 +25,7 @@ endif()
 add_subdirectory(RayTracedShadow)
 
 if (RTXNS_BUILD_DONUT_RENDER_PYTHON)
+    add_subdirectory(Interop)
     add_subdirectory(PythonBindings)
 endif()
 

@@ -38,6 +38,7 @@ target_link_libraries(${RTXNS_DONUT_RENDER_RUNTIME_TARGET}
     PRIVATE
         donut_app
         donut_render
+        rtxns_interop
         rtxns_ray_traced_shadow)
 
 set_target_properties(${RTXNS_DONUT_RENDER_RUNTIME_TARGET} PROPERTIES

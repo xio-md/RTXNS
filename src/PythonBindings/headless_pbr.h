@@ -7,6 +7,11 @@
 #include <string>
 #include <vector>
 
+namespace rtxns::interop
+{
+    class SharedTransformStream;
+}
+
 namespace rtxns::python
 {
     struct ContextInitOptions
@@ -15,6 +20,7 @@ namespace rtxns::python
         std::string backend = "vulkan";
         int device_index = -1;
         bool enable_debug = false;
+        bool enable_external_interop = false;
     };
 
     /// Camera descriptor used by add_camera / set_camera(index).
@@ -102,6 +108,21 @@ namespace rtxns::python
         void update_node_transforms_batch(
             const std::vector<uint32_t>& handles,
             const std::vector<std::vector<float>>& matrices);
+
+        struct SharedTransformConsumeToken
+        {
+            uint64_t epoch = 0;
+            uint64_t simulation_step = 0;
+            uint64_t timestamp_ns = 0;
+            uint32_t slot = 0;
+            uint32_t record_count = 0;
+        };
+
+        [[nodiscard]] SharedTransformConsumeToken consume_shared_transform_slot(
+            const std::shared_ptr<rtxns::interop::SharedTransformStream>& stream,
+            uint32_t slot,
+            const std::vector<uint32_t>& handles);
+
         [[nodiscard]] std::vector<float> get_node_world_transform(
             const std::string& name) const;
         [[nodiscard]] std::vector<float> get_node_world_transform_by_handle(
@@ -194,4 +215,6 @@ namespace rtxns::python
     std::shared_ptr<RendererContext> initialize(const ContextInitOptions& options);
     void shutdown();
     std::shared_ptr<HeadlessPbrScene> create_scene();
+    std::shared_ptr<rtxns::interop::SharedTransformStream>
+        create_shared_transform_stream(uint32_t record_count, uint32_t slot_count = 3);
 }

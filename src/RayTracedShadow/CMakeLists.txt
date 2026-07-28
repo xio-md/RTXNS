@@ -1,6 +1,8 @@
 include(${CMAKE_SOURCE_DIR}/external/donut/compileshaders.cmake)
 
 set(LIB_NAME rtxns_ray_traced_shadow)
+set(RTXNS_OMM_DIR "${CMAKE_SOURCE_DIR}/../OMM"
+    CACHE PATH "Path to the NVIDIA Opacity Micro-Map SDK checkout")
 
 # ---- Shader compilation ----
 
@@ -55,11 +57,11 @@ target_link_libraries(${LIB_NAME}
         donut_render
         nvrhi
     PRIVATE
-        "${CMAKE_SOURCE_DIR}/../OMM/build/libraries/omm-lib/$<CONFIG>/omm-bake.lib")
+        "${RTXNS_OMM_DIR}/build/libraries/omm-lib/$<CONFIG>/omm-bake.lib")
 
 target_include_directories(${LIB_NAME}
     PRIVATE
-        "${CMAKE_SOURCE_DIR}/../OMM/libraries/omm-lib/include")
+        "${RTXNS_OMM_DIR}/libraries/omm-lib/include")
 
 target_compile_definitions(${LIB_NAME}
     PRIVATE

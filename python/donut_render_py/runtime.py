@@ -68,6 +68,7 @@ class RuntimeOptions:
     device_index: int
     log_level: object
     enable_debug: bool
+    enable_external_interop: bool
     module_dir: Path
     runtime_dir: Path
 
@@ -1637,6 +1638,7 @@ class Scene:
             backend=self._options.backend,
             device_index=self._options.device_index,
             enable_debug=self._options.enable_debug,
+            enable_external_interop=self._options.enable_external_interop,
         )
         self._apply_environment()
 
@@ -1696,6 +1698,7 @@ def init(
     log_level: object = None,
     *,
     enable_debug: bool = False,
+    enable_external_interop: bool = False,
     module_dir: str | os.PathLike[str] | None = None,
     runtime_dir: str | os.PathLike[str] | None = None,
 ) -> None:
@@ -1714,6 +1717,7 @@ def init(
         device_index=int(device_index),
         log_level=log_level,
         enable_debug=bool(enable_debug),
+        enable_external_interop=bool(enable_external_interop),
         module_dir=resolved_module_dir,
         runtime_dir=resolved_runtime_dir,
     )
